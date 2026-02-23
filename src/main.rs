@@ -67,7 +67,8 @@ fn handle_logs(
     if run.is_none() {
         println!("Available runs:");
 
-        if let Some(ssh) = &target_cfg.ssh {
+        if executor::should_use_ssh(target_cfg) {
+            let ssh = target_cfg.ssh.as_ref().unwrap();
             Command::new("ssh")
                 .arg(ssh)
                 .arg(format!("ls {}", base))
@@ -89,7 +90,8 @@ fn handle_logs(
 
     println!("\nShowing log: {}\n", stdout_path);
 
-    if let Some(ssh) = &target_cfg.ssh {
+    if executor::should_use_ssh(target_cfg) {
+        let ssh = target_cfg.ssh.as_ref().unwrap();
         Command::new("ssh")
             .arg(ssh)
             .arg(format!("cat {}", stdout_path))

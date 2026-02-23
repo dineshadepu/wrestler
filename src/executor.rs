@@ -6,7 +6,9 @@ use crate::config::Target;
 use crate::planner::{ConcretePhase, RunPlan};
 
 fn ensure_directory(path: &str, target: &Target) -> Result<()> {
-    if let Some(ssh) = &target.ssh {
+    if should_use_ssh(target) {
+        let ssh = target.ssh.as_ref().unwrap();
+
         Command::new("ssh")
             .arg(ssh)
             .arg(format!("mkdir -p {}", path))
@@ -16,6 +18,19 @@ fn ensure_directory(path: &str, target: &Target) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn should_use_ssh(target: &Target) -> bool {
+    if target.ssh.is_none() {
+        return false;
+    }
+
+    // If root path exists locally, we are already on that machine
+    if std::path::Path::new(&target.root).exists() {
+        return false;
+    }
+
+    true
 }
 
 pub fn execute_run(
@@ -75,7 +90,8 @@ fn create_directories(plan: &RunPlan, target: &Target) -> Result<()> {
     let run_dir = format!("{}/run", plan.run_root);
     let analysis_dir = format!("{}/analysis", plan.run_root);
 
-    if let Some(ssh) = &target.ssh {
+    if should_use_ssh(target) {
+        let ssh = target.ssh.as_ref().unwrap();
         let cmd = format!("mkdir -p {} {} {}", logs_dir, run_dir, analysis_dir);
 
         Command::new("ssh").arg(ssh).arg(cmd).status()?;
@@ -101,8 +117,9 @@ fn execute_phase(
     let shell = build_shell_string(&phase.program, &phase.args, &phase.cwd);
 
     println!("> {}", shell);
+    let output = if should_use_ssh(target) {
+        let ssh = target.ssh.as_ref().unwrap();
 
-    let output = if let Some(ssh) = &target.ssh {
         Command::new("ssh").arg(ssh).arg(&shell).output()?
     } else {
         Command::new("sh").arg("-c").arg(&shell).output()?
@@ -112,7 +129,8 @@ fn execute_phase(
     let stdout_path = format!("{}/{}.stdout", logs_dir, phase_name);
     let stderr_path = format!("{}/{}.stderr", logs_dir, phase_name);
 
-    if let Some(ssh) = &target.ssh {
+    if should_use_ssh(target) {
+        let ssh = target.ssh.as_ref().unwrap();
         // Write logs remotely
         write_remote_log(ssh, &stdout_path, &output.stdout)?;
         write_remote_log(ssh, &stderr_path, &output.stderr)?;
