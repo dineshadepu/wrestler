@@ -8,23 +8,26 @@ use crate::{Case, Context, Experiment, Runner, Task};
 /// embedding in a driver's usage message.
 pub const FLAGS_HELP: &str =
 "  --dry-run       print the commands without executing
+  --force, -f     rerun cases even when their output folder already
+                  has files (without it, such cases are skipped —
+                  delete a case folder to mark it for rerun)
   --post-only     skip the solvers; run only the post-process
                   scripts against data already on disk
-  --missing-only  run only cases whose output folder is
-                  missing or empty (delete a case folder to
-                  mark it for rerun)
   --case <name>   run only the named case; a 1-based index
-                  works too (repeatable, combines with
-                  --post-only)";
+                  works too (repeatable, combines with --force
+                  and --post-only)";
 
 /// Driver-side CLI options shared by every experiment package:
 /// which cases to run, whether to run solvers or only the
 /// post-processing, and dry-run mode.
+///
+/// Solver runs are lazy by default: a case whose output folder
+/// already has files is skipped unless `force` is set.
 #[derive(Default)]
 pub struct RunOptions {
     pub dry_run: bool,
     pub post_only: bool,
-    pub missing_only: bool,
+    pub force: bool,
     /// Case selectors: exact case names or 1-based indices.
     pub cases: Vec<String>,
 }
@@ -46,7 +49,7 @@ impl RunOptions {
             match arg.as_str() {
                 "--dry-run" => opts.dry_run = true,
                 "--post-only" => opts.post_only = true,
-                "--missing-only" => opts.missing_only = true,
+                "--force" | "-f" => opts.force = true,
                 "--case" => match it.next() {
                     Some(value) => opts.cases.push(value),
                     None => return Err("--case needs a value".to_string()),
@@ -95,10 +98,15 @@ impl RunOptions {
             }
         }
 
-        if self.missing_only {
+        // Solver runs are lazy: without --force, a case whose output
+        // folder already has files is left alone.
+        if !self.force && !self.post_only {
             for case in &all_cases {
                 if case_has_output(&output_directory, &case.name) {
-                    println!("skipping case {} (output already exists)", case.name);
+                    println!(
+                        "skipping case {} (output exists; --force to rerun)",
+                        case.name
+                    );
                 }
             }
         }
@@ -115,23 +123,30 @@ impl RunOptions {
             inner: experiment,
             out: output_directory.clone(),
             only: &selected,
-            missing_only: self.missing_only,
+            force: self.force,
             post_only: self.post_only,
         };
 
         let mut ctx = Context::default();
 
         if self.post_only {
-            let runner = Runner::new().dry_run(self.dry_run);
+            // Best effort: one case whose data turned out unusable
+            // (e.g. snapshots deleted by clean_outputs.sh) must not
+            // block the other cases or the cross-case comparison.
+            let runner = Runner::new()
+                .continue_on_case_failure(true)
+                .dry_run(self.dry_run);
             runner.run(&selection, &mut ctx)
         } else {
-            // A filtered run must not replace the full experiment's
-            // run.sh with its partial script (report.json is safe
-            // either way — the runner merges it).
-            let filtered = !selected.is_empty() || self.missing_only;
+            // Only a forced, unfiltered run is the "full experiment";
+            // anything else must not replace the full run.sh with its
+            // partial script (report.json is safe either way — the
+            // runner merges it). A first run into an empty output tree
+            // still writes run.sh, since there is nothing to preserve.
+            let full_rerun = self.force && selected.is_empty();
             let runner = Runner::new()
                 .output_directory(output_directory)
-                .preserve_existing_script(filtered)
+                .preserve_existing_script(!full_rerun)
                 .dry_run(self.dry_run);
             runner.run(&selection, &mut ctx)
         }
@@ -147,14 +162,15 @@ fn case_has_output(out: &PathBuf, name: &str) -> bool {
 }
 
 /// View of an experiment with the CLI selectors applied:
-///   --case          keep only the named cases
-///   --missing-only  keep only cases whose output folder is missing/empty
-///   --post-only     strip the pre-process and solver tasks, keep post
+///   --case       keep only the named cases
+///   --force      also run cases whose output folder already has files
+///                (without it, solver runs are lazy and skip them)
+///   --post-only  strip the pre-process and solver tasks, keep post
 struct Selection<'a, E: Experiment> {
     inner: &'a E,
     out: PathBuf,
     only: &'a [String],
-    missing_only: bool,
+    force: bool,
     post_only: bool,
 }
 
@@ -176,7 +192,12 @@ impl<E: Experiment> Experiment for Selection<'_, E> {
             .cases()
             .into_iter()
             .filter(|case| self.only.is_empty() || self.only.contains(&case.name))
-            .filter(|case| !self.missing_only || !case_has_output(&self.out, &case.name))
+            // Lazy by default: a case with existing output only reruns
+            // under --force (post-only instead *requires* existing
+            // output; its filter is below).
+            .filter(|case| {
+                self.force || self.post_only || !case_has_output(&self.out, &case.name)
+            })
             // Post-only can only work on cases that have data; skip the
             // rest (e.g. a case that was intentionally never run) so the
             // remaining posts and the cross-case comparison still happen.

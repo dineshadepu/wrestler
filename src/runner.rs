@@ -14,6 +14,7 @@ pub struct Runner {
     output_directory: Option<PathBuf>,
     dry_run: bool,
     preserve_script: bool,
+    continue_on_case_failure: bool,
 }
 
 impl Runner {
@@ -41,6 +42,16 @@ impl Runner {
     /// experiment's reproduction script.
     pub fn preserve_existing_script(mut self, preserve: bool) -> Self {
         self.preserve_script = preserve;
+        self
+    }
+
+    /// When enabled, a failing case doesn't abort the experiment: the
+    /// failure is reported, the remaining cases and the experiment's
+    /// post-process still run, and `run()` returns an error at the end.
+    /// Used by best-effort modes like post-only, where one case with
+    /// unusable data shouldn't block the others.
+    pub fn continue_on_case_failure(mut self, enable: bool) -> Self {
+        self.continue_on_case_failure = enable;
         self
     }
 
@@ -173,6 +184,8 @@ impl Runner {
     fn run_stages<E: Experiment>(&self, experiment: &E, report: &mut RunReport) -> Result<()> {
         self.execute(&experiment.pre_process(), None, "pre_process", report)?;
 
+        let mut failed_cases: Vec<String> = Vec::new();
+
         for case in experiment.cases() {
             println!();
             println!("=================================");
@@ -185,11 +198,24 @@ impl Runner {
             // Written even when the case failed, so the record of what
             // happened travels with the case folder.
             let saved = self.save_case_report(experiment.name(), &case.name, &report.tasks[first..]);
-            outcome?;
+
+            if let Err(error) = outcome {
+                if !self.continue_on_case_failure {
+                    return Err(error);
+                }
+                println!("case {} failed ({error:#}); continuing", case.name);
+                failed_cases.push(case.name.clone());
+            }
             saved?;
         }
 
-        self.execute(&experiment.post_process(), None, "post_process", report)
+        self.execute(&experiment.post_process(), None, "post_process", report)?;
+
+        if !failed_cases.is_empty() {
+            bail!("case(s) failed: {}", failed_cases.join(", "));
+        }
+
+        Ok(())
     }
 
     fn run_case(&self, case: &crate::Case, report: &mut RunReport) -> Result<()> {
