@@ -15,7 +15,13 @@ pub const FLAGS_HELP: &str =
                   scripts against data already on disk
   --case <name>   run only the named case; a 1-based index
                   works too (repeatable, combines with --force
-                  and --post-only)";
+                  and --post-only)
+  -- <args>...    (or: the first flag not listed above) everything
+                  from here on is passed straight through to the
+                  solver binary, verbatim — only applied when exactly
+                  one case ends up running (use --case to narrow a
+                  multi-case experiment down to one); e.g.
+                  `cargo run <experiment> --case 1 --out-every 5 --kn 1e5`";
 
 /// Driver-side CLI options shared by every experiment package:
 /// which cases to run, whether to run solvers or only the
@@ -30,6 +36,13 @@ pub struct RunOptions {
     pub force: bool,
     /// Case selectors: exact case names or 1-based indices.
     pub cases: Vec<String>,
+    /// Everything after the first flag `from_args` doesn't recognize
+    /// (or after a literal `--`), verbatim and in order. Forwarded to
+    /// the solver's own args — but only when exactly one case ends up
+    /// running (see [`RunOptions::run`]); with more than one, applying
+    /// the same override to every case would be silently wrong, so
+    /// they're dropped with a warning instead.
+    pub extra_args: Vec<String>,
 }
 
 impl RunOptions {
@@ -37,6 +50,11 @@ impl RunOptions {
     /// Returns the positional experiment name, if any, alongside the
     /// parsed options; `Err` carries a message describing the
     /// unknown or malformed argument.
+    ///
+    /// The experiment name must come before any solver passthrough
+    /// args (matching every driver's own `cargo run <experiment>
+    /// [flags...]` usage) — an unrecognized flag before the name is
+    /// still a hard error, since there'd be no case to attach it to.
     pub fn from_args<I>(args: I) -> std::result::Result<(Option<String>, Self), String>
     where
         I: IntoIterator<Item = String>,
@@ -54,6 +72,21 @@ impl RunOptions {
                     Some(value) => opts.cases.push(value),
                     None => return Err("--case needs a value".to_string()),
                 },
+                "--" => {
+                    // Explicit separator: everything after this is
+                    // solver passthrough, even if it happens to look
+                    // like a wrestler flag.
+                    opts.extra_args.extend(it);
+                    break;
+                }
+                _ if arg.starts_with("--") && name.is_some() => {
+                    // First flag we don't recognize: from here on,
+                    // everything (including this token) is solver
+                    // passthrough — see RunOptions::extra_args.
+                    opts.extra_args.push(arg);
+                    opts.extra_args.extend(it);
+                    break;
+                }
                 _ if arg.starts_with("--") => {
                     return Err(format!("unknown option: {arg}"));
                 }
@@ -125,6 +158,7 @@ impl RunOptions {
             only: &selected,
             force: self.force,
             post_only: self.post_only,
+            extra_args: &self.extra_args,
         };
 
         let mut ctx = Context::default();
@@ -166,12 +200,15 @@ fn case_has_output(out: &PathBuf, name: &str) -> bool {
 ///   --force      also run cases whose output folder already has files
 ///                (without it, solver runs are lazy and skip them)
 ///   --post-only  strip the pre-process and solver tasks, keep post
+///   extra_args   solver passthrough, only when exactly one case
+///                survives every other filter (see `cases()` below)
 struct Selection<'a, E: Experiment> {
     inner: &'a E,
     out: PathBuf,
     only: &'a [String],
     force: bool,
     post_only: bool,
+    extra_args: &'a [String],
 }
 
 impl<E: Experiment> Experiment for Selection<'_, E> {
@@ -188,7 +225,8 @@ impl<E: Experiment> Experiment for Selection<'_, E> {
     }
 
     fn cases(&self) -> Vec<Case> {
-        self.inner
+        let mut cases: Vec<Case> = self
+            .inner
             .cases()
             .into_iter()
             .filter(|case| self.only.is_empty() || self.only.contains(&case.name))
@@ -202,17 +240,99 @@ impl<E: Experiment> Experiment for Selection<'_, E> {
             // rest (e.g. a case that was intentionally never run) so the
             // remaining posts and the cross-case comparison still happen.
             .filter(|case| !self.post_only || case_has_output(&self.out, &case.name))
-            .map(|mut case| {
-                if self.post_only {
-                    case.pre_process.clear();
-                    case.run.clear();
+            .collect();
+
+        // Solver passthrough only ever applies to a single, unambiguous
+        // case — broadcasting the same override (e.g. --kn 1e5) across
+        // an angle sweep would silently corrupt every case but one.
+        if !self.extra_args.is_empty() && !self.post_only {
+            match cases.as_mut_slice() {
+                [case] => {
+                    for task in &mut case.run {
+                        task.args.extend(self.extra_args.iter().cloned());
+                    }
                 }
-                case
-            })
-            .collect()
+                _ => eprintln!(
+                    "warning: ignoring passthrough arg(s) `{}` — {} case(s) would run, \
+                     need exactly 1 (use --case to select one)",
+                    self.extra_args.join(" "),
+                    cases.len()
+                ),
+            }
+        }
+
+        if self.post_only {
+            for case in &mut cases {
+                case.pre_process.clear();
+                case.run.clear();
+            }
+        }
+
+        cases
     }
 
     fn post_process(&self) -> Vec<Task> {
         self.inner.post_process()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn known_flags_only_leave_extra_args_empty() {
+        let (name, opts) = RunOptions::from_args(args("stack_of_cylinders --force --case 1"))
+            .unwrap();
+        assert_eq!(name, Some("stack_of_cylinders".to_string()));
+        assert!(opts.force);
+        assert_eq!(opts.cases, vec!["1".to_string()]);
+        assert!(opts.extra_args.is_empty());
+    }
+
+    #[test]
+    fn first_unrecognized_flag_after_name_switches_to_passthrough() {
+        let (name, opts) =
+            RunOptions::from_args(args("stack_of_cylinders --force --out-every 5 --kn 1e5"))
+                .unwrap();
+        assert_eq!(name, Some("stack_of_cylinders".to_string()));
+        assert!(opts.force);
+        assert_eq!(
+            opts.extra_args,
+            vec!["--out-every", "5", "--kn", "1e5"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_separator_forces_passthrough_even_for_known_looking_flags() {
+        let (name, opts) =
+            RunOptions::from_args(args("stack_of_cylinders --force -- --case 2 --dry-run"))
+                .unwrap();
+        assert_eq!(name, Some("stack_of_cylinders".to_string()));
+        assert!(opts.force);
+        assert!(opts.cases.is_empty()); // --case after `--` is NOT parsed as wrestler's own flag
+        assert!(!opts.dry_run);
+        assert_eq!(
+            opts.extra_args,
+            vec!["--case", "2", "--dry-run"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unrecognized_flag_before_name_is_still_an_error() {
+        match RunOptions::from_args(args("--out-every 5 stack_of_cylinders")) {
+            Err(msg) => assert!(msg.contains("--out-every")),
+            Ok(_) => panic!("expected an error"),
+        }
     }
 }

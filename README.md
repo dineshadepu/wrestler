@@ -191,10 +191,49 @@ pattern.
 --case <name>   run only the named case; a 1-based index
                 works too (repeatable, combines with --force
                 and --post-only)
+-- <args>...    (or: the first flag not listed above) everything
+                from here on is passed straight through to the
+                solver binary, verbatim — only applied when exactly
+                one case ends up running (use --case to narrow a
+                multi-case experiment down to one); e.g.
+                `cargo run <experiment> --case 1 --out-every 5 --kn 1e5`
 ```
 
 This text is available as `wrestler::FLAGS_HELP` for embedding in a
 driver's own `usage()`.
+
+### Solver passthrough args
+
+`RunOptions::from_args` only owns the fixed flag set above. It parses
+left to right, and the moment it hits a `--flag` it doesn't recognize
+(after the experiment name), it stops interpreting anything and takes
+that token plus everything after it, verbatim, as `extra_args` —
+without trying to figure out which of them are flags versus values. A
+literal `--` does the same thing explicitly, which is the escape hatch
+for a passthrough token that would otherwise collide with a wrestler
+flag name (e.g. the solver has its own unrelated `--force`):
+
+```
+cargo run stack_of_cylinders --force --out-every 5 --kn 1e5
+#                            ^^^^^^^ wrestler's own flag
+#                                    ^^^^^^^^^^^^^^^^^^^^^^^ extra_args, forwarded to the solver
+cargo run stack_of_cylinders -- --force 5   # `--force` here goes to the solver, not wrestler
+```
+
+`extra_args` is only ever appended to a case's `run` task(s) — and only
+when the case list has resolved down to **exactly one** entry after
+`--case` filtering and the lazy/post-only rules have run. This is a
+correctness guard, not a limitation to work around: appending the same
+override to every case of a multi-case sweep (e.g. an angle sweep)
+would silently apply one case's intended value to all the others. If
+more than one case would run, the args are dropped with a printed
+warning instead of being applied to any of them — narrow the run to one
+case first with `--case <name-or-index>`.
+
+The experiment name must still come before the first passthrough
+token — `cargo run --out-every 5 stack_of_cylinders` is a hard parse
+error, since wrestler would have no case to attach `--out-every 5` to
+yet.
 
 ## Behavior notes
 
@@ -247,4 +286,8 @@ driver's own `usage()`.
 
 `cargo test` covers `Task::to_shell()`'s directory-anchoring rules
 (relative working directories are anchored to `$ROOT`, absolute ones used
-as-is, empty ones fall back to `$ROOT` itself).
+as-is, empty ones fall back to `$ROOT` itself), and `RunOptions::from_args`'s
+passthrough parsing: known flags leave `extra_args` empty, the first
+unrecognized flag after the experiment name switches to passthrough,
+an explicit `--` forces passthrough even for known-looking flags, and
+an unrecognized flag before the experiment name is still a hard error.
