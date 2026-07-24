@@ -43,6 +43,11 @@ pub struct RunOptions {
     /// the same override to every case would be silently wrong, so
     /// they're dropped with a warning instead.
     pub extra_args: Vec<String>,
+    /// Machine label recorded in `report.json` (see
+    /// [`crate::RunReport::machine`]). Not a CLI flag `from_args` parses
+    /// — driver binaries resolve this themselves (e.g. from a local
+    /// config file) and set it directly before calling [`RunOptions::run`].
+    pub machine: String,
 }
 
 impl RunOptions {
@@ -169,7 +174,8 @@ impl RunOptions {
             // block the other cases or the cross-case comparison.
             let runner = Runner::new()
                 .continue_on_case_failure(true)
-                .dry_run(self.dry_run);
+                .dry_run(self.dry_run)
+                .machine(self.machine.clone());
             runner.run(&selection, &mut ctx)
         } else {
             // Only a forced, unfiltered run is the "full experiment";
@@ -181,7 +187,8 @@ impl RunOptions {
             let runner = Runner::new()
                 .output_directory(output_directory)
                 .preserve_existing_script(!full_rerun)
-                .dry_run(self.dry_run);
+                .dry_run(self.dry_run)
+                .machine(self.machine.clone());
             runner.run(&selection, &mut ctx)
         }
     }

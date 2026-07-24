@@ -16,6 +16,12 @@ pub struct TaskRecord {
 #[derive(Serialize, Deserialize)]
 pub struct RunReport {
     pub experiment: String,
+    /// Machine label the run executed under, e.g. "mac" or "runpod_a100"
+    /// (see [`crate::Runner::machine`]). Empty when the caller never set
+    /// one. `#[serde(default)]` so older report.json files without this
+    /// field still deserialize.
+    #[serde(default)]
+    pub machine: String,
     pub success: bool,
     pub total_duration_seconds: f64,
     pub tasks: Vec<TaskRecord>,
@@ -25,6 +31,7 @@ impl RunReport {
     pub fn new(experiment: impl Into<String>) -> Self {
         Self {
             experiment: experiment.into(),
+            machine: String::new(),
             success: false,
             total_duration_seconds: 0.0,
             tasks: Vec::new(),

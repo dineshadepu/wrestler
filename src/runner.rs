@@ -15,6 +15,7 @@ pub struct Runner {
     dry_run: bool,
     preserve_script: bool,
     continue_on_case_failure: bool,
+    machine: String,
 }
 
 impl Runner {
@@ -52,6 +53,15 @@ impl Runner {
     /// unusable data shouldn't block the others.
     pub fn continue_on_case_failure(mut self, enable: bool) -> Self {
         self.continue_on_case_failure = enable;
+        self
+    }
+
+    /// Machine label recorded in `report.json` (see [`RunReport::machine`]),
+    /// e.g. "mac" or "runpod_a100". Purely informational — has no effect
+    /// on where anything is written; the caller decides that via
+    /// `output_directory`. Left empty (the default) if never set.
+    pub fn machine(mut self, machine: impl Into<String>) -> Self {
+        self.machine = machine.into();
         self
     }
 
@@ -131,6 +141,7 @@ impl Runner {
 
         let start = Instant::now();
         let mut report = RunReport::new(experiment.name());
+        report.machine = self.machine.clone();
 
         let outcome = self.run_stages(experiment, &mut report);
 
@@ -173,6 +184,9 @@ impl Runner {
 
         RunReport {
             experiment: new.experiment,
+            // Both reports live under the same output_directory, so they
+            // share a machine by construction; the new run's value wins.
+            machine: new.machine,
             success: new.success && tasks.iter().all(|t| t.success),
             // A merged report spans several invocations, so the sum of
             // its task durations is the only meaningful total.
@@ -198,6 +212,7 @@ impl Runner {
             // Written even when the case failed, so the record of what
             // happened travels with the case folder.
             let saved = self.save_case_report(experiment.name(), &case.name, &report.tasks[first..]);
+            let scripted = self.save_case_script(&case);
 
             if let Err(error) = outcome {
                 if !self.continue_on_case_failure {
@@ -207,6 +222,7 @@ impl Runner {
                 failed_cases.push(case.name.clone());
             }
             saved?;
+            scripted?;
         }
 
         self.execute(&experiment.post_process(), None, "post_process", report)?;
@@ -245,6 +261,7 @@ impl Runner {
 
         let report = RunReport {
             experiment: experiment.to_string(),
+            machine: self.machine.clone(),
             success: records.iter().all(|t| t.success),
             total_duration_seconds: records.iter().map(|t| t.duration_seconds).sum(),
             tasks: records.to_vec(),
@@ -254,6 +271,45 @@ impl Runner {
             case_dir.join("report.json"),
             serde_json::to_string_pretty(&report)?,
         )?;
+
+        Ok(())
+    }
+
+    /// Duplicate this case's own commands into
+    /// `<output_directory>/<case>/run.sh`, so a case folder is
+    /// self-contained: pulling just that folder (e.g. from a GPU machine)
+    /// tells you exactly what was run to produce it, without needing the
+    /// full experiment's `run.sh`. Mirrors `save_case_report` below —
+    /// written after the case runs (so its own `pre_process` has already
+    /// created the case folder) and replaced exactly when the case is
+    /// re-run.
+    fn save_case_script(&self, case: &crate::Case) -> Result<()> {
+        let Some(dir) = &self.output_directory else {
+            return Ok(());
+        };
+
+        let case_dir = dir.join(&case.name);
+        if !case_dir.is_dir() {
+            return Ok(());
+        }
+
+        let mut file = File::create(case_dir.join("run.sh"))?;
+        self.render_case_script(case, &mut file)
+    }
+
+    fn render_case_script(&self, case: &crate::Case, file: &mut impl Write) -> Result<()> {
+        writeln!(file, "#!/bin/bash")?;
+        writeln!(file)?;
+        writeln!(file, "# Case: {}", case.name)?;
+        writeln!(file)?;
+        writeln!(file, "set -e")?;
+        writeln!(file)?;
+        writeln!(file, "ROOT=\"$(pwd)\"")?;
+        writeln!(file)?;
+
+        self.write_tasks(file, &case.pre_process)?;
+        self.write_tasks(file, &case.run)?;
+        self.write_tasks(file, &case.post_process)?;
 
         Ok(())
     }
