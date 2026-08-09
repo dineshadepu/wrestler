@@ -7,7 +7,9 @@ use crate::{Case, Context, Experiment, Runner, Task};
 /// Help text for the flags [`RunOptions::from_args`] understands, for
 /// embedding in a driver's usage message.
 pub const FLAGS_HELP: &str =
-"  --dry-run       print the commands without executing
+"  --list-cases    print the experiment's cases and exit, with the
+                  index --case accepts and which already have output
+  --dry-run       print the commands without executing
   --force, -f     rerun cases even when their output folder already
                   has files (without it, such cases are skipped —
                   delete a case folder to mark it for rerun)
@@ -34,6 +36,9 @@ pub struct RunOptions {
     pub dry_run: bool,
     pub post_only: bool,
     pub force: bool,
+    /// Print the case list and exit without running anything. Takes
+    /// precedence over every other option — it is a query, not a run.
+    pub list_cases: bool,
     /// Case selectors: exact case names or 1-based indices.
     pub cases: Vec<String>,
     /// Everything after the first flag `from_args` doesn't recognize
@@ -70,6 +75,7 @@ impl RunOptions {
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
+                "--list-cases" => opts.list_cases = true,
                 "--dry-run" => opts.dry_run = true,
                 "--post-only" => opts.post_only = true,
                 "--force" | "-f" => opts.force = true,
@@ -111,6 +117,14 @@ impl RunOptions {
     /// timings) survive.
     pub fn run<E: Experiment>(&self, experiment: &E, output_directory: PathBuf) -> Result<()> {
         let all_cases = experiment.cases();
+
+        // A query, not a run: answered before every other option, so
+        // it never rebuilds, never executes and never depends on
+        // whether --case happens to name something real.
+        if self.list_cases {
+            list_cases(experiment.name(), &all_cases, &output_directory);
+            return Ok(());
+        }
 
         // Resolve each --case selector: exact case name, or 1-based
         // index into the experiment's case list. A mistyped selector
@@ -191,6 +205,52 @@ impl RunOptions {
                 .machine(self.machine.clone());
             runner.run(&selection, &mut ctx)
         }
+    }
+}
+
+/// Print an experiment's cases in the order they would run.
+///
+/// Shows the 1-based index [`RunOptions::cases`] accepts alongside the
+/// name, and marks the cases that already have output — that mark is
+/// exactly what decides whether a case is skipped, so the listing
+/// doubles as "what would a plain run actually do?".
+fn list_cases(experiment: &str, cases: &[Case], out: &PathBuf) {
+    println!(
+        "{experiment}: {} case{}",
+        cases.len(),
+        if cases.len() == 1 { "" } else { "s" }
+    );
+
+    let width = cases.iter().map(|case| case.name.len()).max().unwrap_or(0);
+    let mut any_output = false;
+
+    for (index, case) in cases.iter().enumerate() {
+        let has_output = case_has_output(out, &case.name);
+        any_output |= has_output;
+        // trim_end so names shorter than the widest don't carry the
+        // alignment padding out to end-of-line when there's no marker.
+        let line = format!(
+            "  {:>2}  {:<width$}{}",
+            index + 1,
+            case.name,
+            if has_output { "  [has output]" } else { "" },
+            width = width
+        );
+        println!("{}", line.trim_end());
+    }
+
+    if cases.is_empty() {
+        return;
+    }
+
+    println!();
+    if any_output {
+        println!(
+            "Select with --case <name|index>. Cases marked [has output] are skipped \
+             unless --force."
+        );
+    } else {
+        println!("Select with --case <name|index>.");
     }
 }
 
@@ -333,6 +393,21 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn list_cases_is_parsed_not_passed_through() {
+        let (name, opts) = RunOptions::from_args(args("stack_of_cylinders --list-cases")).unwrap();
+        assert_eq!(name, Some("stack_of_cylinders".to_string()));
+        assert!(opts.list_cases);
+        assert!(opts.extra_args.is_empty());
+    }
+
+    #[test]
+    fn list_cases_works_before_the_experiment_name_too() {
+        let (name, opts) = RunOptions::from_args(args("--list-cases stack_of_cylinders")).unwrap();
+        assert_eq!(name, Some("stack_of_cylinders".to_string()));
+        assert!(opts.list_cases);
     }
 
     #[test]

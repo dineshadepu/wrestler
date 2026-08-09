@@ -3,7 +3,8 @@
 A small Rust library for driving reproducible computational experiments:
 running an external solver binary over a set of parameter cases, post-
 processing each case's output, and comparing cases against each other —
-with a standard CLI (`--dry-run`, `--force`, `--post-only`, `--case`),
+with a standard CLI (`--list-cases`, `--dry-run`, `--force`, `--post-only`,
+`--case`),
 a reproducible `run.sh`, and a `report.json` of what ran and how long it
 took.
 
@@ -51,8 +52,8 @@ package's `main.rs` only has to describe *what* to run, not *how*.
   writes `run.sh` (a standalone bash reproduction of the whole run),
   `report.json`, and per-task stdout/stderr logs.
 
-- **`RunOptions`** — parses the driver CLI (`--dry-run`, `--force`/`-f`,
-  `--post-only`, `--case <name>`) and wraps an `Experiment` with that
+- **`RunOptions`** — parses the driver CLI (`--list-cases`, `--dry-run`,
+  `--force`/`-f`, `--post-only`, `--case <name>`) and wraps an `Experiment` with that
   behavior (lazy skip-if-already-run, case filtering, post-only) before
   handing it to a `Runner`. This is what every package's `main.rs`
   actually uses — see below.
@@ -182,6 +183,13 @@ pattern.
 ## CLI flags (via `RunOptions`)
 
 ```
+--list-cases    print the experiment's cases and exit: the 1-based
+                index --case accepts, the name, and which already
+                have output. A query — never rebuilds, never runs.
+                Prefer it over --dry-run for "what cases are there?":
+                dry-run applies the same laziness a real run would,
+                so it hides cases that already have output unless
+                --force is also given
 --dry-run       print the commands without executing
 --force, -f     rerun cases even when their output folder already
                 has files (without it, such cases are skipped —
@@ -272,7 +280,11 @@ yet.
   run leaves an existing `run.sh` untouched, so it keeps describing the
   full experiment rather than being clobbered by a partial one. A first
   run into an empty output tree always writes it, since there's nothing
-  to preserve yet.
+  to preserve yet. Each case folder also gets its own
+  `<output>/<case>/run.sh` — just that case's `pre_process`/`run`/
+  `post_process` commands, standalone-runnable — written after the case
+  runs and replaced exactly when that case is re-run, mirroring the
+  per-case `report.json` above.
 
 - **Per-task logs.** Each task's stdout/stderr, if non-empty, is written
   to `<output_directory>/logs/<NN>_<case>_<task-name>.{stdout,stderr}.log`.
