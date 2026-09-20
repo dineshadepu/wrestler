@@ -109,6 +109,76 @@ impl RunOptions {
         Ok((name, opts))
     }
 
+    /// Print an experiment's cases in the order they would run.
+    ///
+    /// Shows the 1-based index [`RunOptions::cases`] accepts alongside
+    /// the name, and marks the cases that already have output. That
+    /// mark is what decides whether a case is skipped, so the listing
+    /// doubles as "what would this command actually do?" — which is
+    /// why the summary underneath is written against the flags that
+    /// were ACTUALLY passed. `--list-cases --force` must not print
+    /// advice to pass `--force`.
+    fn print_case_list(&self, experiment: &str, cases: &[Case], out: &PathBuf) {
+        let total = cases.len();
+        println!(
+            "{experiment}: {total} case{}",
+            if total == 1 { "" } else { "s" }
+        );
+
+        let width = cases.iter().map(|case| case.name.len()).max().unwrap_or(0);
+        let mut with_output = 0usize;
+
+        for (index, case) in cases.iter().enumerate() {
+            let has_output = case_has_output(out, &case.name);
+            if has_output {
+                with_output += 1;
+            }
+            // trim_end so names shorter than the widest don't carry the
+            // alignment padding out to end-of-line when there is no mark.
+            let line = format!(
+                "  {:>2}  {:<width$}{}",
+                index + 1,
+                case.name,
+                if has_output { "  [has output]" } else { "" },
+                width = width
+            );
+            println!("{}", line.trim_end());
+        }
+
+        if cases.is_empty() {
+            return;
+        }
+
+        let without_output = total - with_output;
+        println!();
+        println!(
+            "[has output] = {}/<case>/ exists and is non-empty",
+            out.display()
+        );
+
+        // What THIS invocation's flags would do, not generic advice.
+        if self.post_only {
+            println!(
+                "--post-only: post-processing would run for the {with_output} case(s) \
+                 with output; {without_output} skipped."
+            );
+        } else if self.force {
+            println!(
+                "--force: all {total} case(s) would run, overwriting the output of \
+                 the {with_output} marked above."
+            );
+        } else if with_output > 0 {
+            println!(
+                "A plain run would run {without_output} case(s) and skip the \
+                 {with_output} marked above; --force runs all {total}."
+            );
+        } else {
+            println!("A plain run would run all {total} case(s).");
+        }
+
+        println!("Select one with --case <name|index>.");
+    }
+
     /// Run `experiment` with these options applied. `output_directory`
     /// is the experiment's output root, holding one subfolder per case
     /// — it decides which cases already have data, and receives the
@@ -122,7 +192,7 @@ impl RunOptions {
         // it never rebuilds, never executes and never depends on
         // whether --case happens to name something real.
         if self.list_cases {
-            list_cases(experiment.name(), &all_cases, &output_directory);
+            self.print_case_list(experiment.name(), &all_cases, &output_directory);
             return Ok(());
         }
 
@@ -205,52 +275,6 @@ impl RunOptions {
                 .machine(self.machine.clone());
             runner.run(&selection, &mut ctx)
         }
-    }
-}
-
-/// Print an experiment's cases in the order they would run.
-///
-/// Shows the 1-based index [`RunOptions::cases`] accepts alongside the
-/// name, and marks the cases that already have output — that mark is
-/// exactly what decides whether a case is skipped, so the listing
-/// doubles as "what would a plain run actually do?".
-fn list_cases(experiment: &str, cases: &[Case], out: &PathBuf) {
-    println!(
-        "{experiment}: {} case{}",
-        cases.len(),
-        if cases.len() == 1 { "" } else { "s" }
-    );
-
-    let width = cases.iter().map(|case| case.name.len()).max().unwrap_or(0);
-    let mut any_output = false;
-
-    for (index, case) in cases.iter().enumerate() {
-        let has_output = case_has_output(out, &case.name);
-        any_output |= has_output;
-        // trim_end so names shorter than the widest don't carry the
-        // alignment padding out to end-of-line when there's no marker.
-        let line = format!(
-            "  {:>2}  {:<width$}{}",
-            index + 1,
-            case.name,
-            if has_output { "  [has output]" } else { "" },
-            width = width
-        );
-        println!("{}", line.trim_end());
-    }
-
-    if cases.is_empty() {
-        return;
-    }
-
-    println!();
-    if any_output {
-        println!(
-            "Select with --case <name|index>. Cases marked [has output] are skipped \
-             unless --force."
-        );
-    } else {
-        println!("Select with --case <name|index>.");
     }
 }
 

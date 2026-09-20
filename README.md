@@ -186,6 +186,9 @@ pattern.
 --list-cases    print the experiment's cases and exit: the 1-based
                 index --case accepts, the name, and which already
                 have output. A query — never rebuilds, never runs.
+                The summary underneath is written against the flags
+                actually passed, so `--list-cases --force` reports
+                what --force would do rather than advising it.
                 Prefer it over --dry-run for "what cases are there?":
                 dry-run applies the same laziness a real run would,
                 so it hides cases that already have output unless
