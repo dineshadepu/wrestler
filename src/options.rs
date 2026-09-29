@@ -2,7 +2,10 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::{Case, Context, Experiment, Runner, Task};
+use crate::{
+    remote::{self, RemoteAction, RemoteRequest},
+    Case, Context, Experiment, Runner, Task,
+};
 
 /// Help text for the flags [`RunOptions::from_args`] understands, for
 /// embedding in a driver's usage message.
@@ -23,7 +26,17 @@ pub const FLAGS_HELP: &str =
                   solver binary, verbatim — only applied when exactly
                   one case ends up running (use --case to narrow a
                   multi-case experiment down to one); e.g.
-                  `cargo run <experiment> --case 1 --out-every 5 --kn 1e5`";
+                  `cargo run <experiment> --case 1 --out-every 5 --kn 1e5`
+
+Remote (hosts and sync rules come from ./wrestler.toml):
+  --remote <host> push this directory to <host> and start the run
+                  there, detached; --force/--post-only/--case and
+                  solver args are forwarded, --dry-run prints the
+                  rsync/ssh commands instead
+  --status <host> is it still running? exit code and log tail
+  --pull <host>   copy <host>'s output folder back (light: skips the
+                  [pull] excludes, e.g. raw/); add --full for all
+  --stop <host>   end a run started with --remote";
 
 /// Driver-side CLI options shared by every experiment package:
 /// which cases to run, whether to run solvers or only the
@@ -49,10 +62,15 @@ pub struct RunOptions {
     /// they're dropped with a warning instead.
     pub extra_args: Vec<String>,
     /// Machine label recorded in `report.json` (see
-    /// [`crate::RunReport::machine`]). Not a CLI flag `from_args` parses
-    /// — driver binaries resolve this themselves (e.g. from a local
-    /// config file) and set it directly before calling [`RunOptions::run`].
+    /// [`crate::RunReport::machine`]). Not a CLI flag: `from_args` fills
+    /// it from [`crate::machine`] (`$MACHINE`, else `[local] machine` in
+    /// `wrestler.toml`, else "local"). Drivers should build their output
+    /// folder from it (`outputs/<experiment>/<machine>`) so runs on
+    /// different machines, and `--pull`, never overwrite each other.
     pub machine: String,
+    /// `--remote`/`--status`/`--pull`/`--stop <host>`: act on another
+    /// machine instead of running here (see [`crate::remote`]).
+    pub remote: Option<RemoteRequest>,
 }
 
 impl RunOptions {
@@ -69,8 +87,12 @@ impl RunOptions {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut opts = Self::default();
+        let mut opts = Self {
+            machine: remote::machine(),
+            ..Self::default()
+        };
         let mut name = None;
+        let mut full = false;
 
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -83,6 +105,26 @@ impl RunOptions {
                     Some(value) => opts.cases.push(value),
                     None => return Err("--case needs a value".to_string()),
                 },
+                "--full" => full = true,
+                "--remote" | "--status" | "--pull" | "--stop" => {
+                    let Some(host) = it.next() else {
+                        return Err(format!("{arg} needs a host (a [hosts.<name>] in wrestler.toml)"));
+                    };
+                    if let Some(previous) = &opts.remote {
+                        return Err(format!(
+                            "{arg} {host}: only one remote action per invocation \
+                             (already have one for {})",
+                            previous.host
+                        ));
+                    }
+                    let action = match arg.as_str() {
+                        "--remote" => RemoteAction::Launch,
+                        "--status" => RemoteAction::Status,
+                        "--pull" => RemoteAction::Pull { full: false },
+                        _ => RemoteAction::Stop,
+                    };
+                    opts.remote = Some(RemoteRequest { action, host });
+                }
                 "--" => {
                     // Explicit separator: everything after this is
                     // solver passthrough, even if it happens to look
@@ -106,7 +148,66 @@ impl RunOptions {
             }
         }
 
+        opts.check_remote_combination(full)?;
         Ok((name, opts))
+    }
+
+    /// Reject flag combinations a remote action would silently ignore.
+    fn check_remote_combination(&mut self, full: bool) -> std::result::Result<(), String> {
+        let Some(request) = &mut self.remote else {
+            return if full {
+                Err("--full only applies to --pull <host>".to_string())
+            } else {
+                Ok(())
+            };
+        };
+
+        if self.list_cases {
+            return Err("--list-cases is local only; use --status <host> for a remote run".to_string());
+        }
+
+        match &mut request.action {
+            RemoteAction::Pull { full: pull_full } => *pull_full = full,
+            _ if full => return Err("--full only applies to --pull <host>".to_string()),
+            _ => {}
+        }
+
+        let selects_cases = self.force
+            || self.post_only
+            || !self.cases.is_empty()
+            || !self.extra_args.is_empty();
+        if request.action != RemoteAction::Launch && selects_cases {
+            return Err(
+                "--force/--post-only/--case and solver args only go with --remote <host> \
+                 (--status/--pull/--stop act on the whole experiment)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The arguments a `--remote` run is started with on the host: this
+    /// invocation minus the remote action and `--dry-run` (which, with
+    /// `--remote`, means "show the rsync/ssh commands" locally).
+    fn forwarded_args(&self, experiment: &str) -> Vec<String> {
+        let mut args = vec![experiment.to_string()];
+        if self.force {
+            args.push("--force".to_string());
+        }
+        if self.post_only {
+            args.push("--post-only".to_string());
+        }
+        for case in &self.cases {
+            args.push("--case".to_string());
+            args.push(case.clone());
+        }
+        if !self.extra_args.is_empty() {
+            // Explicit separator, so a solver arg that happens to share a
+            // wrestler flag's name still reaches the solver on the host.
+            args.push("--".to_string());
+            args.extend(self.extra_args.iter().cloned());
+        }
+        args
     }
 
     /// Print an experiment's cases in the order they would run.
@@ -186,6 +287,13 @@ impl RunOptions {
     /// that bookkeeping so the originals from the real run (e.g. GPU
     /// timings) survive.
     pub fn run<E: Experiment>(&self, experiment: &E, output_directory: PathBuf) -> Result<()> {
+        // Nothing runs here: the same command is replayed on the host
+        // (or asked about, pulled from, stopped there).
+        if let Some(request) = &self.remote {
+            let forwarded = self.forwarded_args(experiment.name());
+            return remote::execute(request, experiment.name(), &forwarded, self.dry_run);
+        }
+
         let all_cases = experiment.cases();
 
         // A query, not a run: answered before every other option, so
@@ -432,6 +540,42 @@ mod tests {
         let (name, opts) = RunOptions::from_args(args("--list-cases stack_of_cylinders")).unwrap();
         assert_eq!(name, Some("stack_of_cylinders".to_string()));
         assert!(opts.list_cases);
+    }
+
+    #[test]
+    fn remote_launch_forwards_selection_and_solver_args() {
+        let (name, opts) = RunOptions::from_args(args(
+            "cyl --remote gpu1 --force --case 2 --dry-run --out-every 5 --remote x",
+        ))
+        .unwrap();
+        assert_eq!(name, Some("cyl".to_string()));
+        assert_eq!(
+            opts.remote,
+            Some(RemoteRequest { action: RemoteAction::Launch, host: "gpu1".to_string() })
+        );
+        assert!(opts.dry_run);
+        // --dry-run stays local; the solver's own `--remote x` is passthrough.
+        assert_eq!(
+            opts.forwarded_args("cyl"),
+            args("cyl --force --case 2 -- --out-every 5 --remote x")
+        );
+    }
+
+    #[test]
+    fn full_goes_with_pull_only() {
+        let (_, opts) = RunOptions::from_args(args("cyl --pull gpu1 --full")).unwrap();
+        assert_eq!(opts.remote.unwrap().action, RemoteAction::Pull { full: true });
+        assert!(RunOptions::from_args(args("cyl --full")).is_err());
+        assert!(RunOptions::from_args(args("cyl --status gpu1 --full")).is_err());
+    }
+
+    #[test]
+    fn remote_actions_reject_what_they_would_ignore() {
+        assert!(RunOptions::from_args(args("cyl --pull gpu1 --case 1")).is_err());
+        assert!(RunOptions::from_args(args("cyl --stop gpu1 --force")).is_err());
+        assert!(RunOptions::from_args(args("cyl --remote gpu1 --list-cases")).is_err());
+        assert!(RunOptions::from_args(args("cyl --remote gpu1 --status gpu1")).is_err());
+        assert!(RunOptions::from_args(args("cyl --remote")).is_err());
     }
 
     #[test]
