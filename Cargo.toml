@@ -2,6 +2,13 @@
 name = "wrestler"
 version = "0.2.0"
 edition = "2024"
+description = "A small library for driving reproducible computational experiments: running a solver over a set of parameter cases, post-processing each case, and comparing cases against each other."
+readme = "README.md"
+keywords = ["experiment", "reproducibility", "simulation", "benchmark", "cli"]
+categories = ["science", "command-line-utilities"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dineshadepu/wrestler"
+exclude = ["/.claude"]
 
 [dependencies]
 anyhow = "1"
